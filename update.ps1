@@ -62,13 +62,28 @@ function Get-AgentRelease {
   throw 'Nenhum release agent-v encontrado no GitHub.'
 }
 
+function Invoke-NativeQuiet {
+  param(
+    [Parameter(Mandatory = $true)][string]$File,
+    [Parameter(ValueFromRemainingArguments = $true)][string[]]$ArgumentList
+  )
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $File @ArgumentList *> $null
+    return $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $previous
+  }
+}
+
 function Stop-PidTree($ProcId) {
   if (-not $ProcId) { return }
-  & taskkill.exe /PID $ProcId /T /F *> $null
+  Invoke-NativeQuiet taskkill.exe /PID $ProcId /T /F | Out-Null
 }
 
 function Stop-LemonChat {
-  & schtasks.exe /End /TN $TaskName *> $null
+  Invoke-NativeQuiet schtasks.exe /End /TN $TaskName | Out-Null
   Start-Sleep -Milliseconds 400
   foreach ($name in @('watchdog.pid', 'worker.pid')) {
     $pidFile = Join-Path $Root $name
@@ -176,12 +191,12 @@ try {
   if (-not $asset) { throw "Release $($release.tag_name) sem $ZipName" }
   Write-UpdateLog "Atualizando $local -> $remote"
   Install-Release $asset.browser_download_url $remote
-  & schtasks.exe /Run /TN $TaskName *> $null
+  Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
   Write-UpdateLog "Lemon Chat $remote instalado."
 } catch {
   Write-UpdateLog ("Falha: {0}" -f $_.Exception.Message)
   if (Test-Path (Join-Path $Root 'app\Lemon Chat.exe')) {
-    & schtasks.exe /Run /TN $TaskName *> $null
+    Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
   }
   throw
 }
