@@ -50,25 +50,52 @@ function Get-LocalVersion {
   return (Get-Content -Path $file -Raw -Encoding UTF8).Trim()
 }
 
-function Get-AgentRelease {
-  $headers = @{
-    'User-Agent' = 'LemonChat'
-    'Accept'     = 'application/vnd.github+json'
-  }
-  $releases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repo/releases?per_page=30"
-  $best = $null
-  $bestVersion = ''
-  foreach ($release in @($releases)) {
-    $tag = [string]$release.tag_name
-    if ($tag -notlike 'agent-v*') { continue }
-    $version = $tag -replace '^agent-v', ''
-    if (-not $best -or (Test-IsNewer $version $bestVersion)) {
-      $best = $release
-      $bestVersion = $version
+function Get-VersionFromReleaseLocation([string]$Location) {
+  $match = [regex]::Match([string]$Location, 'agent-v(\d+(?:\.\d+){1,3})')
+  if (-not $match.Success) { return '' }
+  return $match.Groups[1].Value
+}
+
+function Get-LatestReleaseLocation {
+  $uri = "https://github.com/$Repo/releases/latest"
+  $delays = @(2, 5, 10)
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    $response = $null
+    try {
+      $request = [System.Net.HttpWebRequest]::Create($uri)
+      $request.AllowAutoRedirect = $false
+      $request.Method = 'GET'
+      $request.UserAgent = 'LemonChat'
+      $request.Timeout = 20000
+      $response = $request.GetResponse()
+      $status = [int]$response.StatusCode
+      $location = [string]$response.Headers['Location']
+      if ($status -ge 500 -or [string]::IsNullOrWhiteSpace($location)) {
+        throw "HTTP $status ao consultar o release"
+      }
+      return $location
+    } catch {
+      if ($attempt -ge 3) { throw }
+      Start-Sleep -Seconds $delays[[Math]::Min($attempt, $delays.Count - 1)]
+    } finally {
+      if ($response) { $response.Close() }
     }
   }
-  if (-not $best) { throw 'Nenhum release agent-v encontrado no GitHub.' }
-  return $best
+}
+
+function Get-RemoteVersion {
+  try {
+    $version = Get-VersionFromReleaseLocation (Get-LatestReleaseLocation)
+    if ($version) { return $version }
+  } catch {
+    Write-UpdateLog ("Aviso ao ler o release: {0}" -f $_.Exception.Message)
+  }
+  $uri = "https://raw.githubusercontent.com/$Repo/main/VERSION"
+  $version = ([string](Invoke-RestMethod -Headers @{ 'User-Agent' = 'LemonChat' } -Uri $uri)).Trim()
+  if ($version -notmatch '^\d+(\.\d+){1,3}$') {
+    throw 'Nao foi possivel descobrir a versao do Lemon Chat. A API do GitHub nao respondeu.'
+  }
+  return $version
 }
 
 function Invoke-NativeQuiet {
@@ -209,7 +236,29 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
     $zip = Join-Path $tmp 'agent.zip'
-    Invoke-WebRequest -Uri $ZipUrl -OutFile $zip -UseBasicParsing
+    $delays = @(5, 15, 30)
+    for ($attempt = 0; $attempt -lt 4; $attempt++) {
+      $response = $null
+      $file = $null
+      try {
+        $request = [System.Net.HttpWebRequest]::Create($ZipUrl)
+        $request.UserAgent = 'LemonChat'
+        $request.AllowAutoRedirect = $true
+        $request.Timeout = 300000
+        $request.ReadWriteTimeout = 300000
+        $response = $request.GetResponse()
+        $file = [System.IO.File]::Create($zip)
+        $response.GetResponseStream().CopyTo($file)
+        break
+      } catch {
+        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
+        if ($attempt -ge 3) { throw }
+        Start-Sleep -Seconds $delays[[Math]::Min($attempt, $delays.Count - 1)]
+      } finally {
+        if ($file) { $file.Close() }
+        if ($response) { $response.Close() }
+      }
+    }
     $extract = Join-Path $tmp 'extract'
     Expand-Archive -Path $zip -DestinationPath $extract -Force
     Remove-InstalledApp
@@ -239,8 +288,7 @@ if ($MyInvocation.InvocationName -eq '.') { return }
 
 try {
   Ensure-Root
-  $release = Get-AgentRelease
-  $remote = ([string]$release.tag_name) -replace '^agent-v', ''
+  $remote = Get-RemoteVersion
   $local = Get-LocalVersion
   $exe = Join-Path $Root 'app\Lemon Chat.exe'
   if (-not (Test-IsNewer $remote $local) -and (Test-Path $exe)) {
@@ -249,10 +297,9 @@ try {
     Write-UpdateLog "Lemon Chat $local ja esta atualizado."
     return
   }
-  $asset = @($release.assets) | Where-Object { $_.name -eq $ZipName } | Select-Object -First 1
-  if (-not $asset) { throw "Release $($release.tag_name) sem $ZipName" }
+  $zipUrl = "https://github.com/$Repo/releases/download/agent-v$remote/$ZipName"
   Write-UpdateLog "Atualizando $local -> $remote"
-  Install-Release $asset.browser_download_url $remote
+  Install-Release $zipUrl $remote
   Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
   Write-UpdateLog "Lemon Chat $remote instalado."
 } catch {
