@@ -302,7 +302,7 @@ function Register-LemonChatTasks {
   $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
   Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
 
-  $updateArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"irm $UpdateScriptUrl | iex`""
+  $updateArgs = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"`$env:LEMON_UPDATE_QUIET='1'; irm $UpdateScriptUrl | iex`""
   $updateAction = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $updateArgs
   $updateTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(20) -RepetitionInterval (New-TimeSpan -Hours 6) -RepetitionDuration (New-TimeSpan -Days 9999)
   $updateSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 30)
@@ -352,9 +352,29 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
     Register-LemonChatTasks
     Write-UpdateStep 'Criando o atalho na area de trabalho...'
     Install-DesktopShortcut $exe
+    return $exe
   } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
+}
+
+function Start-LemonInterface {
+  $exe = Join-Path $Root 'app\Lemon Chat.exe'
+  if (-not (Test-Path -LiteralPath $exe)) { return }
+  $work = Split-Path -LiteralPath $exe
+  Write-UpdateStep 'Abrindo a bandeja do Lemon Chat...'
+  $tray = Start-Process -FilePath $exe -WorkingDirectory $work -PassThru
+  $opened = [datetime]::UtcNow
+  for ($i = 0; $i -lt 40; $i++) {
+    if ($tray.HasExited) {
+      Write-UpdateStep 'A bandeja encerrou ao abrir. Use o atalho Lemon Chat na area de trabalho.'
+      return
+    }
+    if (([datetime]::UtcNow - $opened).TotalSeconds -ge 5) { break }
+    Start-Sleep -Milliseconds 250
+  }
+  Write-UpdateStep 'Abrindo a tela do Lemon Chat...'
+  Start-Process -FilePath $exe -WorkingDirectory $work | Out-Null
 }
 
 # install-local.ps1 importa as funcoes com dot-source. irm | iex segue para a instalacao.
@@ -372,15 +392,17 @@ try {
   if (-not (Test-IsNewer $remote $local) -and (Test-Path $exe)) {
     Register-LemonChatTasks
     Install-DesktopShortcut $exe
+    if ($env:LEMON_UPDATE_QUIET -ne '1') { Start-LemonInterface }
     Write-UpdateStep "Lemon Chat $local ja esta atualizado."
     return
   }
   $zipUrl = "https://github.com/$Repo/releases/download/agent-v$remote/$ZipName"
   Write-UpdateStep "Atualizando $shownLocal -> $remote"
   Install-Release $zipUrl $remote
-  Write-UpdateStep 'Iniciando o Lemon Chat...'
+  Write-UpdateStep 'Iniciando o WhatsApp...'
   Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
-  Write-UpdateStep "Lemon Chat $remote instalado."
+  Start-LemonInterface
+  Write-UpdateStep "Lemon Chat $remote instalado. A tela e a bandeja foram abertas."
 } catch {
   Write-UpdateStep ("Falha: {0}" -f $_.Exception.Message)
   if (Test-Path (Join-Path $Root 'app\Lemon Chat.exe')) {
