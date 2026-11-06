@@ -56,10 +56,19 @@ function Get-AgentRelease {
     'Accept'     = 'application/vnd.github+json'
   }
   $releases = Invoke-RestMethod -Headers $headers -Uri "https://api.github.com/repos/$Repo/releases?per_page=30"
+  $best = $null
+  $bestVersion = ''
   foreach ($release in @($releases)) {
-    if ($release.tag_name -like 'agent-v*') { return $release }
+    $tag = [string]$release.tag_name
+    if ($tag -notlike 'agent-v*') { continue }
+    $version = $tag -replace '^agent-v', ''
+    if (-not $best -or (Test-IsNewer $version $bestVersion)) {
+      $best = $release
+      $bestVersion = $version
+    }
   }
-  throw 'Nenhum release agent-v encontrado no GitHub.'
+  if (-not $best) { throw 'Nenhum release agent-v encontrado no GitHub.' }
+  return $best
 }
 
 function Invoke-NativeQuiet {
@@ -82,33 +91,85 @@ function Stop-PidTree($ProcId) {
   Invoke-NativeQuiet taskkill.exe /PID $ProcId /T /F | Out-Null
 }
 
-function Stop-LemonChat {
-  Invoke-NativeQuiet schtasks.exe /End /TN $TaskName | Out-Null
-  Start-Sleep -Milliseconds 400
-  foreach ($name in @('watchdog.pid', 'worker.pid')) {
-    $pidFile = Join-Path $Root $name
-    if (-not (Test-Path $pidFile)) { continue }
-    $value = (Get-Content -Path $pidFile -Raw -ErrorAction SilentlyContinue).Trim()
-    if ($value -match '^\d+$') { Stop-PidTree ([int]$value) }
-    Remove-Item $pidFile -ErrorAction SilentlyContinue
+function Test-LemonLockProcess {
+  param(
+    [int]$ProcessId,
+    [int]$SelfPid,
+    [string]$Name,
+    [string]$ExecutablePath,
+    [string]$CommandLine,
+    [string]$AppDir
+  )
+  if ($ProcessId -le 0 -or $ProcessId -eq $SelfPid) { return $false }
+  $prefix = ''
+  if (-not [string]::IsNullOrWhiteSpace($AppDir)) {
+    $prefix = $AppDir.TrimEnd('\') + '\'
   }
-  Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
-    $_.Name -eq 'Lemon Chat.exe' -and $_.CommandLine -like '*--worker*'
-  } | ForEach-Object { Stop-PidTree $_.ProcessId }
+  $exe = [string]$ExecutablePath
+  $cmd = [string]$CommandLine
+  # A bandeja (sem --worker) e os processos do Chromium mapeiam locales\pt-BR.pak.
+  if ($prefix) {
+    if ($exe.StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase)) { return $true }
+    if ($cmd.IndexOf($prefix, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) { return $true }
+  }
+  if ($Name -eq 'Lemon Chat.exe' -and [string]::IsNullOrWhiteSpace($exe)) { return $true }
+  if ($cmd -like '*run-agent.ps1*') { return $true }
+  return $false
 }
 
-function Wait-AppUnlocked {
-  $exe = Join-Path $Root 'app\Lemon Chat.exe'
-  for ($i = 0; $i -lt 20; $i++) {
-    if (-not (Test-Path $exe)) { return }
+function Get-LemonLockProcesses {
+  $appDir = Join-Path $Root 'app'
+  return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | Where-Object {
+    Test-LemonLockProcess -ProcessId $_.ProcessId -SelfPid $PID -Name $_.Name -ExecutablePath $_.ExecutablePath -CommandLine $_.CommandLine -AppDir $appDir
+  } | Sort-Object { if ([string]$_.CommandLine -like '*run-agent.ps1*') { 0 } else { 1 } }, ProcessId)
+}
+
+function Stop-LemonChat {
+  Invoke-NativeQuiet schtasks.exe /End /TN $TaskName | Out-Null
+  for ($attempt = 0; $attempt -lt 20; $attempt++) {
+    $targets = @(Get-LemonLockProcesses)
+    if ($targets.Count -eq 0) { break }
+    foreach ($proc in $targets) { Stop-PidTree ([int]$proc.ProcessId) }
+    Start-Sleep -Milliseconds 400
+  }
+  foreach ($name in @('watchdog.pid', 'worker.pid')) {
+    Remove-Item (Join-Path $Root $name) -Force -ErrorAction SilentlyContinue
+  }
+  $left = @(Get-LemonLockProcesses)
+  if ($left.Count -gt 0) {
+    $ids = ($left | ForEach-Object { '{0}:{1}' -f $_.ProcessId, $_.Name }) -join ', '
+    throw "Nao foi possivel encerrar o Lemon Chat ($ids). Feche a bandeja e tente de novo."
+  }
+}
+
+function Remove-DirectoryRetry {
+  param(
+    [Parameter(Mandatory = $true)][string]$Path,
+    [int]$Attempts = 8,
+    [int]$DelayMilliseconds = 1000,
+    [scriptblock]$BeforeRetry
+  )
+  if (-not (Test-Path -LiteralPath $Path)) { return }
+  for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
     try {
-      $stream = [System.IO.File]::Open($exe, 'Open', 'Read', 'None')
-      $stream.Close()
+      Get-ChildItem -LiteralPath $Path -Recurse -Force -ErrorAction SilentlyContinue | ForEach-Object {
+        try { $_.Attributes = 'Normal' } catch {}
+      }
+      Remove-Item -LiteralPath $Path -Recurse -Force -ErrorAction Stop
       return
     } catch {
-      Start-Sleep -Seconds 1
+      if ($attempt -ge $Attempts) { throw }
+      if ($BeforeRetry) { & $BeforeRetry }
+      Start-Sleep -Milliseconds $DelayMilliseconds
     }
   }
+}
+
+function Remove-InstalledApp {
+  $appDir = Join-Path $Root 'app'
+  if (-not (Test-Path -LiteralPath $appDir)) { return }
+  Stop-LemonChat
+  Remove-DirectoryRetry -Path $appDir -BeforeRetry { Stop-LemonChat }
 }
 
 function Ensure-Root {
@@ -151,10 +212,8 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
     Invoke-WebRequest -Uri $ZipUrl -OutFile $zip -UseBasicParsing
     $extract = Join-Path $tmp 'extract'
     Expand-Archive -Path $zip -DestinationPath $extract -Force
-    Stop-LemonChat
-    Wait-AppUnlocked
+    Remove-InstalledApp
     $appDir = Join-Path $Root 'app'
-    if (Test-Path $appDir) { Remove-Item $appDir -Recurse -Force }
     New-Item -ItemType Directory -Force -Path $appDir | Out-Null
     Get-ChildItem -Path $extract | Where-Object { $_.Name -notin @('scripts', 'VERSION', 'Instalar Lemon Chat.cmd') } | ForEach-Object {
       Copy-Item -Path $_.FullName -Destination $appDir -Recurse -Force
@@ -174,6 +233,9 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
   }
 }
+
+# install-local.ps1 importa as funcoes com dot-source. irm | iex segue para a instalacao.
+if ($MyInvocation.InvocationName -eq '.') { return }
 
 try {
   Ensure-Root
