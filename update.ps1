@@ -398,6 +398,8 @@ try {
   }
   $zipUrl = "https://github.com/$Repo/releases/download/agent-v$remote/$ZipName"
   Write-UpdateStep "Atualizando $shownLocal -> $remote"
+  Write-UpdateStep 'Fechando a bandeja e o WhatsApp...'
+  Stop-LemonChat
   Install-Release $zipUrl $remote
   Write-UpdateStep 'Iniciando o WhatsApp...'
   Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
@@ -407,6 +409,7 @@ try {
   Write-UpdateStep ("Falha: {0}" -f $_.Exception.Message)
   if (Test-Path (Join-Path $Root 'app\Lemon Chat.exe')) {
     Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
+    if ($env:LEMON_UPDATE_QUIET -ne '1') { Start-LemonInterface }
   }
   throw
 }
