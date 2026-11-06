@@ -17,6 +17,11 @@ function Write-UpdateLog([string]$Message) {
   Add-Content -Path $LogFile -Value $line -Encoding UTF8
 }
 
+function Write-UpdateStep([string]$Message) {
+  Write-Host $Message
+  try { Write-UpdateLog $Message } catch {}
+}
+
 function ConvertTo-VersionParts([string]$Version) {
   $parts = @()
   foreach ($chunk in ([string]$Version -split '\.')) {
@@ -195,8 +200,94 @@ function Remove-DirectoryRetry {
 function Remove-InstalledApp {
   $appDir = Join-Path $Root 'app'
   if (-not (Test-Path -LiteralPath $appDir)) { return }
+  Write-UpdateStep 'Encerrando a bandeja e o WhatsApp...'
   Stop-LemonChat
+  Write-UpdateStep 'Substituindo a pasta do programa...'
   Remove-DirectoryRetry -Path $appDir -BeforeRetry { Stop-LemonChat }
+}
+
+function Save-LemonPackage([string]$Uri, [string]$Destination) {
+  $delays = @(5, 15, 30)
+  for ($attempt = 0; $attempt -lt 4; $attempt++) {
+    if ($attempt -gt 0) { Write-UpdateStep ("Nova tentativa de download ({0}/4)..." -f ($attempt + 1)) }
+    $response = $null
+    $file = $null
+    $stream = $null
+    try {
+      $request = [System.Net.HttpWebRequest]::Create($Uri)
+      $request.UserAgent = 'LemonChat'
+      $request.AllowAutoRedirect = $true
+      $request.Timeout = 300000
+      $request.ReadWriteTimeout = 300000
+      $response = $request.GetResponse()
+      $length = [int64]$response.ContentLength
+      $file = [System.IO.File]::Create($Destination)
+      $stream = $response.GetResponseStream()
+      $buffer = New-Object byte[] 262144
+      $total = [int64]0
+      $lastBucket = -1
+      $nextMark = [datetime]::UtcNow
+      while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+        $file.Write($buffer, 0, $read)
+        $total += $read
+        $now = [datetime]::UtcNow
+        $bucket = -1
+        if ($length -gt 0) { $bucket = [int][Math]::Floor(($total * 10.0) / $length) }
+        if ($bucket -gt $lastBucket -or $now -ge $nextMark) {
+          if ($length -gt 0) {
+            $pct = [int](($total * 100) / $length)
+            Write-Host ("Baixando: {0}% ({1:N1} de {2:N1} MB)" -f $pct, ($total / 1MB), ($length / 1MB))
+          } else {
+            Write-Host ("Baixando: {0:N1} MB" -f ($total / 1MB))
+          }
+          if ($bucket -gt $lastBucket) { $lastBucket = $bucket }
+          $nextMark = $now.AddSeconds(5)
+        }
+      }
+      Write-UpdateStep ("Download concluido ({0:N1} MB)." -f ($total / 1MB))
+      return
+    } catch {
+      if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force -ErrorAction SilentlyContinue }
+      if ($attempt -ge 3) { throw }
+      Start-Sleep -Seconds $delays[[Math]::Min($attempt, $delays.Count - 1)]
+    } finally {
+      if ($stream) { $stream.Close() }
+      if ($file) { $file.Close() }
+      if ($response) { $response.Close() }
+    }
+  }
+}
+
+function Expand-LemonPackage([string]$ZipPath, [string]$Destination) {
+  Add-Type -AssemblyName System.IO.Compression.FileSystem
+  New-Item -ItemType Directory -Force -Path $Destination | Out-Null
+  $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+  try {
+    $entries = @($archive.Entries)
+    $count = $entries.Count
+    $index = 0
+    $lastBucket = -1
+    foreach ($entry in $entries) {
+      $index++
+      $relative = ([string]$entry.FullName).Replace('/', '\')
+      $target = Join-Path $Destination $relative
+      if ($relative.EndsWith('\')) {
+        New-Item -ItemType Directory -Force -Path $target | Out-Null
+      } else {
+        $parent = Split-Path -Parent $target
+        if ($parent) { New-Item -ItemType Directory -Force -Path $parent | Out-Null }
+        [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $target, $true)
+      }
+      $bucket = if ($count -gt 0) { [int][Math]::Floor(($index * 10.0) / $count) } else { 0 }
+      if ($bucket -gt $lastBucket -or $index -eq $count) {
+        $pct = if ($count -gt 0) { [int](($index * 100) / $count) } else { 100 }
+        Write-Host ("Extraindo: {0}% ({1} de {2} arquivos)" -f $pct, $index, $count)
+        $lastBucket = $bucket
+      }
+    }
+  } finally {
+    $archive.Dispose()
+  }
 }
 
 function Ensure-Root {
@@ -236,34 +327,15 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
   New-Item -ItemType Directory -Force -Path $tmp | Out-Null
   try {
     $zip = Join-Path $tmp 'agent.zip'
-    $delays = @(5, 15, 30)
-    for ($attempt = 0; $attempt -lt 4; $attempt++) {
-      $response = $null
-      $file = $null
-      try {
-        $request = [System.Net.HttpWebRequest]::Create($ZipUrl)
-        $request.UserAgent = 'LemonChat'
-        $request.AllowAutoRedirect = $true
-        $request.Timeout = 300000
-        $request.ReadWriteTimeout = 300000
-        $response = $request.GetResponse()
-        $file = [System.IO.File]::Create($zip)
-        $response.GetResponseStream().CopyTo($file)
-        break
-      } catch {
-        if (Test-Path -LiteralPath $zip) { Remove-Item -LiteralPath $zip -Force -ErrorAction SilentlyContinue }
-        if ($attempt -ge 3) { throw }
-        Start-Sleep -Seconds $delays[[Math]::Min($attempt, $delays.Count - 1)]
-      } finally {
-        if ($file) { $file.Close() }
-        if ($response) { $response.Close() }
-      }
-    }
+    Write-UpdateStep 'Baixando o pacote do Lemon Chat...'
+    Save-LemonPackage $ZipUrl $zip
     $extract = Join-Path $tmp 'extract'
-    Expand-Archive -Path $zip -DestinationPath $extract -Force
+    Write-UpdateStep 'Extraindo o pacote...'
+    Expand-LemonPackage $zip $extract
     Remove-InstalledApp
     $appDir = Join-Path $Root 'app'
     New-Item -ItemType Directory -Force -Path $appDir | Out-Null
+    Write-UpdateStep 'Copiando o programa para C:\lemon_labs\lemon_chat\agent...'
     Get-ChildItem -Path $extract | Where-Object { $_.Name -notin @('scripts', 'VERSION', 'Instalar Lemon Chat.cmd') } | ForEach-Object {
       Copy-Item -Path $_.FullName -Destination $appDir -Recurse -Force
     }
@@ -276,7 +348,9 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
     Set-Content -Path (Join-Path $Root 'VERSION') -Value $Version -Encoding ascii
     $exe = Join-Path $appDir 'Lemon Chat.exe'
     if (-not (Test-Path $exe)) { throw 'O pacote nao contem Lemon Chat.exe' }
+    Write-UpdateStep 'Registrando as tarefas do Windows...'
     Register-LemonChatTasks
+    Write-UpdateStep 'Criando o atalho na area de trabalho...'
     Install-DesktopShortcut $exe
   } finally {
     Remove-Item $tmp -Recurse -Force -ErrorAction SilentlyContinue
@@ -287,23 +361,28 @@ function Install-Release([string]$ZipUrl, [string]$Version) {
 if ($MyInvocation.InvocationName -eq '.') { return }
 
 try {
+  Write-UpdateStep 'Consultando a versao publicada do Lemon Chat...'
   Ensure-Root
   $remote = Get-RemoteVersion
   $local = Get-LocalVersion
+  $shownLocal = $local
+  if ([string]::IsNullOrWhiteSpace($shownLocal)) { $shownLocal = 'nenhuma' }
+  Write-UpdateStep ("Versao neste PC: {0}. Versao publicada: {1}." -f $shownLocal, $remote)
   $exe = Join-Path $Root 'app\Lemon Chat.exe'
   if (-not (Test-IsNewer $remote $local) -and (Test-Path $exe)) {
     Register-LemonChatTasks
     Install-DesktopShortcut $exe
-    Write-UpdateLog "Lemon Chat $local ja esta atualizado."
+    Write-UpdateStep "Lemon Chat $local ja esta atualizado."
     return
   }
   $zipUrl = "https://github.com/$Repo/releases/download/agent-v$remote/$ZipName"
-  Write-UpdateLog "Atualizando $local -> $remote"
+  Write-UpdateStep "Atualizando $shownLocal -> $remote"
   Install-Release $zipUrl $remote
+  Write-UpdateStep 'Iniciando o Lemon Chat...'
   Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
-  Write-UpdateLog "Lemon Chat $remote instalado."
+  Write-UpdateStep "Lemon Chat $remote instalado."
 } catch {
-  Write-UpdateLog ("Falha: {0}" -f $_.Exception.Message)
+  Write-UpdateStep ("Falha: {0}" -f $_.Exception.Message)
   if (Test-Path (Join-Path $Root 'app\Lemon Chat.exe')) {
     Invoke-NativeQuiet schtasks.exe /Run /TN $TaskName | Out-Null
   }
